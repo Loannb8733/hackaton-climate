@@ -38,6 +38,10 @@ from utils.resilience_engine import (
     generate_recommendations,
     get_region_from_postal_code,
     REGIONS_AMPLIFICATION,
+    compute_insurance_risk_score,
+    compute_cost_of_living_impact,
+    compute_pnacc3_effect,
+    PNACC3_TIMELINE,
 )
 from utils.pdf_export import generate_bilan_pdf
 
@@ -448,6 +452,21 @@ def cached_recommendations(region, scenario, target_year, national_anomaly):
 
 
 @st.cache_data
+def cached_insurance_risk(regional_anomaly, region):
+    return compute_insurance_risk_score(regional_anomaly, region)
+
+
+@st.cache_data
+def cached_cost_impact(regional_anomaly, horizon_year):
+    return compute_cost_of_living_impact(regional_anomaly, horizon_year)
+
+
+@st.cache_data
+def cached_pnacc3_effect(anomaly_2100):
+    return compute_pnacc3_effect(anomaly_2100)
+
+
+@st.cache_data
 def load_geojson():
     try:
         resp = requests.get(get_geojson_url(), timeout=10)
@@ -526,6 +545,25 @@ st.caption(
     "Analyse, Visualisation et Prédiction Climatique Multi-Échelle — "
     "Hackathon #26 Sup de Vinci — Big Data & IA"
 )
+
+# --- Bouton d'Urgence ---
+with st.expander("🚨 **URGENCE CLIMAT — Échéances législatives PNACC-3** (cliquez pour voir la timeline)", expanded=False):
+    timeline_cols = st.columns(len(PNACC3_TIMELINE))
+    for i, evt in enumerate(PNACC3_TIMELINE):
+        with timeline_cols[i]:
+            st.markdown(
+                f"<div style='text-align:center; padding:14px 8px; border-radius:14px; "
+                f"background:rgba(255,255,255,0.03); backdrop-filter:blur(12px); "
+                f"border:1px solid {evt['color']}30; min-height:160px;'>"
+                f"<div style='font-size:2rem; font-weight:900; color:{evt['color']}; "
+                f"letter-spacing:-0.05em;'>{evt['year']}</div>"
+                f"<div style='font-size:0.85rem; font-weight:700; color:#f1f5f9; "
+                f"margin:6px 0 4px 0;'>{evt['label']}</div>"
+                f"<div style='font-size:0.72rem; color:#94a3b8; line-height:1.3;'>"
+                f"{evt['detail']}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 # --- KPIs ---
 col1, col2, col3, col4 = st.columns(4)
@@ -1154,6 +1192,37 @@ with tab5:
                     help="Pour chaque euro investi dans l'adaptation, ce montant de dégâts est évité.",
                 )
 
+            # ── Score de Risque Assurantiel ──
+            st.markdown("")
+            insurance_risk = cached_insurance_risk(reco["anomaly_regional"], user_region)
+            cost_impact = cached_cost_impact(reco["anomaly_regional"], sim_year)
+
+            st.markdown(
+                f"<div style='padding:18px 20px; border-radius:14px; "
+                f"background:rgba(255,255,255,0.03); backdrop-filter:blur(12px); "
+                f"border:1px solid {insurance_risk['level_color']}25;'>"
+                f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
+                f"<div>"
+                f"<span style='color:#94a3b8; font-size:0.78rem; text-transform:uppercase; "
+                f"letter-spacing:0.05em;'>Score de Risque Assurantiel</span>"
+                f"<div style='font-size:2.2rem; font-weight:900; color:{insurance_risk['level_color']}; "
+                f"letter-spacing:-0.05em;'>{insurance_risk['score_total']}/100</div>"
+                f"<span style='color:{insurance_risk['level_color']}; font-size:0.85rem; "
+                f"font-weight:600;'>{insurance_risk['level']}</span>"
+                f"</div>"
+                f"<div style='text-align:right;'>"
+                f"<span style='color:#f1f5f9; font-size:0.9rem; font-weight:600;'>"
+                f"Impact coût de la vie d'ici {sim_year}</span><br>"
+                f"<span style='font-size:1.8rem; font-weight:900; color:#f59e0b; "
+                f"letter-spacing:-0.04em;'>+{cost_impact['total_pct']}%</span><br>"
+                f"<span style='color:#94a3b8; font-size:0.75rem;'>"
+                f"Énergie +{cost_impact['by_sector']['Énergie']}% · "
+                f"Assurances +{cost_impact['by_sector']['Assurances']}% · "
+                f"Alimentation +{cost_impact['by_sector']['Alimentation']}%</span>"
+                f"</div></div></div>",
+                unsafe_allow_html=True,
+            )
+
         else:
             st.info("Entrez un code postal valide pour lancer la simulation.")
 
@@ -1264,6 +1333,51 @@ with tab5:
             "mars 2025) et le Haut Conseil pour le Climat (rapport annuel 2025)."
         )
 
+        # ── L'Effet de nos actions (comparatif avec/sans PNACC-3) ──
+        st.markdown("---")
+        st.subheader("L'Effet de nos actions")
+
+        proj_2100_sc = proj_selected[proj_selected["year"] == 2100]
+        if not proj_2100_sc.empty:
+            anomaly_2100 = proj_2100_sc.iloc[0]["anomaly"]
+        else:
+            anomaly_2100 = france_warming_2100
+
+        pnacc3_effect = cached_pnacc3_effect(anomaly_2100)
+
+        effect_cols = st.columns(3)
+        with effect_cols[0]:
+            st.metric(
+                "Sans action (2100)",
+                f"+{pnacc3_effect['anomaly_sans_pnacc3']}°C",
+                f"{pnacc3_effect['degats_sans_mds']} Mds€/an de dégâts",
+                delta_color="inverse",
+                help="Anomalie projetée en 2100 sans politiques d'adaptation ni atténuation renforcées.",
+            )
+        with effect_cols[1]:
+            st.metric(
+                "Avec PNACC-3 + SNBC (2100)",
+                f"+{pnacc3_effect['anomaly_avec_pnacc3']}°C",
+                f"-{pnacc3_effect['delta_anomaly']}°C grâce à l'action",
+                delta_color="normal",
+                help="Anomalie réduite grâce à l'adaptation (PNACC-3) et l'atténuation (SNBC). "
+                     "Le PNACC-3 réduit les dégâts de 35% (France Stratégie).",
+            )
+        with effect_cols[2]:
+            st.metric(
+                "Dégâts évités",
+                f"{pnacc3_effect['degats_evites_mds']} Mds€/an",
+                "grâce aux politiques climat",
+                delta_color="off",
+                help="Économies annuelles permises par la mise en œuvre du PNACC-3 et de la SNBC.",
+            )
+
+        st.caption(
+            "Comparaison basée sur les trajectoires TRACC (Météo-France/DRIAS) et "
+            "l'évaluation socio-économique de France Stratégie (mars 2025). "
+            "Le PNACC-3 réduit les dégâts de ~35%, la SNBC réduit la trajectoire de ~12%."
+        )
+
         # ── Export PDF ──
         st.markdown("---")
         st.subheader("Télécharger votre bilan territorial")
@@ -1283,3 +1397,19 @@ with tab5:
             "Il synthétise les projections climatiques et les mesures d'adaptation "
             "pour votre territoire, alignées sur le PNACC-3."
         )
+
+# ════════════════════════════════════════════════════════════
+# FOOTER
+# ════════════════════════════════════════════════════════════
+st.markdown("---")
+st.markdown(
+    "<div style='text-align:center; padding:30px 20px 20px 20px;'>"
+    "<p style='color:#64748b; font-size:0.82rem; margin:0 0 6px 0;'>"
+    "Propulsé par l'IA au service de la résilience territoriale — Hackathon 2026</p>"
+    "<p style='color:#475569; font-size:0.72rem; margin:0;'>"
+    "Sources : Météo-France (SIM + LSH) via meteo.data.gouv.fr · "
+    "GIEC AR6 · HCC 2025 · PNACC-3 · France Stratégie · CITEPA · DRIAS<br>"
+    "Défi Changement Climatique — defis.data.gouv.fr</p>"
+    "</div>",
+    unsafe_allow_html=True,
+)

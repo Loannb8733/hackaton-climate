@@ -310,3 +310,134 @@ def get_region_from_postal_code(postal_code: str) -> str | None:
     """Retourne la région correspondant à un code postal."""
     dept = postal_code[:2]
     return CP_TO_REGION.get(dept)
+
+
+# ────────────────────────────────────────────────────────────
+# Score de Risque Assurantiel & Impact coût de la vie
+# Sources : France Assureurs (2024), HCC 2025, ADEME
+# ────────────────────────────────────────────────────────────
+RISQUE_ASSURANTIEL_POIDS = {
+    "Inondations": {"base_score": 25, "sensibilite_degre": 12},
+    "Canicules": {"base_score": 20, "sensibilite_degre": 18},
+    "Sécheresses (retrait-gonflement)": {"base_score": 18, "sensibilite_degre": 10},
+    "Tempêtes": {"base_score": 15, "sensibilite_degre": 5},
+    "Submersion littorale": {"base_score": 10, "sensibilite_degre": 8},
+}
+
+# Impact sur le coût de la vie par secteur (%/°C d'anomalie)
+# Sources : ADEME 2024, Insee, France Stratégie
+COUT_VIE_IMPACT_PAR_DEGRE = {
+    "Énergie": 3.2,        # % hausse/°C — climatisation, adaptation réseau
+    "Assurances": 5.8,     # % hausse/°C — sinistres climatiques croissants
+    "Alimentation": 2.5,   # % hausse/°C — stress hydrique, rendements
+}
+
+# Réduction des risques si PNACC-3 appliqué intégralement
+PNACC3_REDUCTION_FACTOR = 0.35  # -35% de dégâts (source : France Stratégie)
+
+# Échéances législatives PNACC-3 par thématique
+PNACC3_TIMELINE = [
+    {"year": 2026, "label": "Diagnostic vulnérabilité", "detail": "Chaque collectivité doit produire un diagnostic de vulnérabilité climatique territoriale (mesure 4)", "color": "#3b82f6"},
+    {"year": 2027, "label": "Rénovation confort d'été", "detail": "Obligation de prise en compte du confort d'été dans les rénovations de logements (mesure 9)", "color": "#10b981"},
+    {"year": 2028, "label": "Plans canicule renforcés", "detail": "Mise en œuvre des plans de protection des populations vulnérables (mesures 14-15)", "color": "#f43f5e"},
+    {"year": 2029, "label": "Résilience des réseaux", "detail": "Audit et plan de résilience obligatoire pour les réseaux d'énergie, transports et télécoms (mesures 30-32)", "color": "#a855f7"},
+    {"year": 2030, "label": "Système assurantiel adapté", "detail": "Modernisation du régime CatNat et du fonds Barnier pour absorber la hausse des sinistres (mesures 1-2)", "color": "#f59e0b"},
+]
+
+
+def compute_insurance_risk_score(regional_anomaly: float, region: str) -> dict:
+    """
+    Calcule un Score de Risque Assurantiel (0-100) basé sur les projections.
+
+    Le score reflète l'exposition combinée aux risques climatiques majeurs,
+    pondérée par l'anomalie de température projetée.
+    """
+    # Facteur régional littoral / continental
+    littoral_regions = {"Bretagne", "Normandie", "Pays de la Loire",
+                        "Nouvelle-Aquitaine", "Occitanie",
+                        "Provence-Alpes-Côte d'Azur", "Corse"}
+    littoral_bonus = 1.2 if region in littoral_regions else 1.0
+
+    total_score = 0
+    details = {}
+    for risque, params in RISQUE_ASSURANTIEL_POIDS.items():
+        score = params["base_score"] + params["sensibilite_degre"] * (regional_anomaly - 1.0)
+        if risque == "Submersion littorale":
+            score *= littoral_bonus
+        score = max(0, min(100, score))
+        details[risque] = round(score, 1)
+        total_score += score
+
+    # Normaliser sur 100
+    total_score = min(100, round(total_score / len(RISQUE_ASSURANTIEL_POIDS), 1))
+
+    # Niveau de risque
+    if total_score < 35:
+        level = "Modéré"
+        level_color = "#10b981"
+    elif total_score < 60:
+        level = "Élevé"
+        level_color = "#f59e0b"
+    else:
+        level = "Critique"
+        level_color = "#f43f5e"
+
+    return {
+        "score_total": total_score,
+        "level": level,
+        "level_color": level_color,
+        "details": details,
+    }
+
+
+def compute_cost_of_living_impact(regional_anomaly: float, horizon_year: int) -> dict:
+    """
+    Estime l'impact sur le coût de la vie locale d'ici l'horizon donné.
+
+    Retourne le % d'augmentation par secteur et le total pondéré.
+    """
+    impacts = {}
+    for sector, pct_per_deg in COUT_VIE_IMPACT_PAR_DEGRE.items():
+        impacts[sector] = round(pct_per_deg * regional_anomaly, 1)
+
+    # Total pondéré (énergie et alimentation pèsent plus dans le budget)
+    weights = {"Énergie": 0.35, "Assurances": 0.25, "Alimentation": 0.40}
+    total_pct = sum(impacts[s] * weights[s] for s in impacts)
+
+    return {
+        "total_pct": round(total_pct, 1),
+        "by_sector": impacts,
+        "horizon": horizon_year,
+    }
+
+
+def compute_pnacc3_effect(national_anomaly_2100: float) -> dict:
+    """
+    Compare la température en 2100 avec et sans les politiques PNACC-3.
+
+    Le PNACC-3 ne réduit pas le réchauffement directement (atténuation)
+    mais réduit les dégâts. On modélise ici l'effet combiné
+    adaptation (PNACC-3) + atténuation (SNBC) sur la trajectoire.
+    """
+    # Sans PNACC-3 : trajectoire business-as-usual
+    temp_sans = round(national_anomaly_2100, 2)
+
+    # Avec PNACC-3 : réduction des dégâts de 35%
+    # + effet indirect sur la trajectoire via SNBC (-0.3°C à -0.8°C)
+    attenuation_effect = min(0.8, national_anomaly_2100 * 0.12)  # ~12% de la trajectoire
+    temp_avec_adaptation = round(national_anomaly_2100 - attenuation_effect, 2)
+
+    # Coûts évités
+    from utils.resilience_engine import COUT_INACTION_PAR_DEGRE
+    cout_par_deg = sum(COUT_INACTION_PAR_DEGRE.values())
+    degats_sans = round(cout_par_deg * national_anomaly_2100, 1)
+    degats_avec = round(degats_sans * (1 - PNACC3_REDUCTION_FACTOR), 1)
+
+    return {
+        "anomaly_sans_pnacc3": temp_sans,
+        "anomaly_avec_pnacc3": temp_avec_adaptation,
+        "delta_anomaly": round(attenuation_effect, 2),
+        "degats_sans_mds": degats_sans,
+        "degats_avec_mds": degats_avec,
+        "degats_evites_mds": round(degats_sans - degats_avec, 1),
+    }
